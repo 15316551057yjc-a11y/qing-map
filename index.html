@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>清代舆图时空演化系统</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <style>
+        body, html { margin: 0; padding: 0; height: 100%; font-family: "STKaiti", "楷体", serif; overflow: hidden; }
+        #map { height: 100%; width: 100%; background: #f4f1ea; }
+
+        /* 右侧时间轴总容器 */
+        #timeline-container {
+            position: absolute; right: 30px; top: 50px; bottom: 50px;
+            width: 160px; z-index: 1000;
+            background: rgba(255, 252, 245, 0.96);
+            border-radius: 10px; border: 2px solid #8b0000;
+            display: flex; flex-direction: row; padding: 20px 10px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.15);
+        }
+
+        /* 刻度文字区域：底部是1223，顶部是1896 */
+        #ticks-container {
+            flex: 1; position: relative; height: 100%; margin-right: 10px;
+        }
+        .tick-label {
+            position: absolute; right: 12px; font-size: 13px; color: #8b0000;
+            font-weight: bold; transform: translateY(50%); bottom: 0; /* 默认靠下 */
+        }
+        /* 物理刻度线 */
+        .tick-mark {
+            position: absolute; right: 0; width: 8px; height: 2px;
+            background: #8b0000; transform: translateY(50%);
+        }
+
+        /* 滑动块区域 */
+        #slider-box { width: 40px; position: relative; height: 100%; }
+
+        /* --- 滑动条样式：彻底告别蓝色 --- */
+        input[type=range] {
+            -webkit-appearance: none; appearance: none;
+            width: 10px; height: 100%; background: transparent;
+            cursor: pointer; writing-mode: bt-lr; appearance: slider-vertical;
+            position: relative; z-index: 5;
+        }
+
+        /* 轨道：红棕色 */
+        input[type=range]::-webkit-slider-runnable-track {
+            width: 10px; height: 100%; background: #8b0000 !important;
+            border-radius: 5px; border: 1px solid #5a0000;
+        }
+
+        /* 滑块点：白底红边 (告别蓝点) */
+        input[type=range]::-webkit-slider-thumb {
+            -webkit-appearance: none; appearance: none;
+            width: 22px; height: 22px; background: #fffcf5;
+            border: 3px solid #8b0000; border-radius: 50%;
+            margin-top: 0; box-shadow: 0 0 10px rgba(0,0,0,0.3);
+        }
+
+        /* Firefox 轨道 */
+        input[type=range]::-moz-range-track { background: #8b0000; border-radius: 5px; }
+        input[type=range]::-moz-range-thumb { 
+            width: 20px; height: 20px; background: #fffcf5; border: 3px solid #8b0000; border-radius: 50%; 
+        }
+
+        /* 年份浮动气泡 */
+        #current-year-tip {
+            position: absolute; left: -115px; background: #8b0000;
+            color: #fff; padding: 6px 12px; border-radius: 4px;
+            font-size: 18px; font-weight: bold; transform: translateY(50%);
+            bottom: 0; pointer-events: none; z-index: 10;
+        }
+        #current-year-tip::after {
+            content: ""; position: absolute; right: -10px; top: 50%;
+            transform: translateY(-50%); border-width: 6px; border-style: solid;
+            border-color: transparent transparent transparent #8b0000;
+        }
+
+        /* 左侧信息面板 */
+        .info-panel {
+            position: absolute; top: 25px; left: 25px; z-index: 1000;
+            background: white; padding: 15px 25px; border: 2px solid #8b0000;
+            border-left-width: 8px; box-shadow: 0 10px 25px rgba(0,0,0,0.1);
+        }
+        #play-btn {
+            margin-top: 10px; padding: 8px 20px; background: #8b0000;
+            color: white; border: none; border-radius: 4px; cursor: pointer;
+            font-family: "STKaiti"; font-size: 16px;
+        }
+        #play-btn:hover { background: #630000; }
+
+        /* GIS 表格 */
+        .gis-table { border-collapse: collapse; width: 280px; font-size: 13px; }
+        .gis-table th { background: #8b0000; color: white; padding: 8px; text-align: left; }
+        .gis-table td { border: 1px solid #e2d7c7; padding: 8px; background: #fffcf5; }
+    </style>
+</head>
+<body>
+
+    <div class="info-panel">
+        <h1 style="margin:0; color:#8b0000; font-size: 24px;">清代舆图时空演化</h1>
+        <button id="play-btn">▶ 开始演化</button>
+    </div>
+
+    <div id="map"></div>
+
+    <div id="timeline-container">
+        <div id="ticks-container"></div>
+        <div id="slider-box">
+            <div id="current-year-tip">1223</div>
+            <input type="range" id="year-slider" min="1223" max="1896" value="1223" step="1">
+        </div>
+    </div>
+
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.3.2/papaparse.min.js"></script>
+
+    <script>
+        const START = 1223, END = 1896;
+        const map = L.map('map', { zoomControl: false }).setView([36, 106], 5);
+        L.tileLayer('https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png').addTo(map);
+
+        let allPoints = [], markersLayer = L.layerGroup().addTo(map), playTimer = null;
+
+        // 1. 生成刻度 (底部0%，顶部100%)
+        const ticksContainer = document.getElementById('ticks-container');
+        for (let y = START; y <= END; y++) {
+            if (y === START || y === END || y % 50 === 0) {
+                const percent = (y - START) / (END - START) * 100;
+                // 加文字
+                const label = document.createElement('div');
+                label.className = 'tick-label';
+                label.style.bottom = percent + "%";
+                label.innerText = y;
+                ticksContainer.appendChild(label);
+                // 加横向刻度线
+                const mark = document.createElement('div');
+                mark.className = 'tick-mark';
+                mark.style.bottom = percent + "%";
+                ticksContainer.appendChild(mark);
+            }
+        }
+
+        // 2. 数据加载
+        fetch('清.geojson').then(res => res.json()).then(data => {
+            L.geoJSON(data, { style: { color: "#8b0000", weight: 1.5, fillOpacity: 0.04 } }).addTo(map);
+        });
+
+        Papa.parse('qingdynasty.csv', {
+            download: true, header: true, dynamicTyping: true,
+            complete: function(res) {
+                allPoints = res.data.filter(d => d.时间 && d.纬度 && d.经度);
+                updateDisplay(START);
+            }
+        });
+
+        // 3. 更新逻辑
+        const slider = document.getElementById('year-slider');
+        const tip = document.getElementById('current-year-tip');
+        const playBtn = document.getElementById('play-btn');
+
+        function updateDisplay(year) {
+            markersLayer.clearLayers();
+            const ratio = (year - START) / (END - START);
+            
+            // 气泡位置：现在是 bottom 向上走
+            tip.style.bottom = (ratio * 100) + "%";
+            tip.innerText = year + " 年";
+            slider.value = year;
+
+            allPoints.forEach(p => {
+                if (p.时间 <= year) {
+                    const isNew = p.时间 === year;
+                    const marker = L.circleMarker([p.纬度, p.经度], {
+                        radius: isNew ? 10 : 4,
+                        fillColor: isNew ? "#ff4500" : "#8b0000",
+                        color: "#fff", weight: 1, fillOpacity: isNew ? 1 : 0.6
+                    });
+                    
+                    let table = `<table class="gis-table"><tr><th colspan="2" style="text-align:center">舆图属性表</th></tr>`;
+                    Object.keys(p).forEach(k => {
+                        if (k !== "经度" && k !== "纬度" && p[k]) table += `<tr><th>${k}</th><td>${p[k]}</td></tr>`;
+                    });
+                    marker.bindPopup(table + `</table>`);
+                    markersLayer.addLayer(marker);
+                }
+            });
+        }
+
+        // 4. 自动播放
+        playBtn.onclick = () => {
+            if (playTimer) {
+                clearInterval(playTimer); playTimer = null; playBtn.innerText = "▶ 开始演化";
+            } else {
+                playBtn.innerText = "⏸ 暂停";
+                playTimer = setInterval(() => {
+                    let cur = parseInt(slider.value);
+                    if (cur < END) updateDisplay(cur + 1);
+                    else { clearInterval(playTimer); playTimer = null; playBtn.innerText = "▶ 开始演化"; }
+                }, 80);
+            }
+        };
+
+        slider.oninput = (e) => {
+            if(playTimer) { clearInterval(playTimer); playTimer = null; playBtn.innerText = "▶ 开始演化"; }
+            updateDisplay(parseInt(e.target.value));
+        };
+    </script>
+</body>
+</html>
